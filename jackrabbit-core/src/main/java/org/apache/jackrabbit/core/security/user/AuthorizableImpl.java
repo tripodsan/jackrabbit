@@ -83,6 +83,18 @@ abstract class AuthorizableImpl implements Authorizable, UserConstants {
     }
 
     /**
+     * Get this authorizables ID but guard any exceptions.
+     * @return this authorizables ID
+     */
+    private String safeGetId() {
+        try {
+            return getID();
+        } catch (RepositoryException e) {
+            return Text.unescapeIllegalJcrChars(Text.getName(node.safeGetJCRPath()));
+        }
+    }
+
+    /**
      * @see Authorizable#declaredMemberOf()
      */
     public Iterator<Group> declaredMemberOf() throws RepositoryException {
@@ -379,7 +391,7 @@ abstract class AuthorizableImpl implements Authorizable, UserConstants {
             log.debug("Collected {} {} group ids for [{}] in {}us, loaded {} groups in {}us (collect={}, cachesize={}/{})", new Object[]{
                     groupNodeIds.size(),
                     includeIndirect ? "transitive" : "declared",
-                    getID(),
+                    safeGetId(),
                     (t1-t0) / 1000,
                     groups.size(),
                     (t2-t1) / 1000,
