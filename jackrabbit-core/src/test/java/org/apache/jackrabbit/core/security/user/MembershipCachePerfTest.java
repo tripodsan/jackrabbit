@@ -49,10 +49,11 @@ public class MembershipCachePerfTest extends JUnitTest {
     private static final String REPO_HOME = new File("target",
             MembershipCachePerfTest.class.getSimpleName()).getPath();
     private static final int NUM_USERS = 10000;
-    private static final int NUM_USERS_PER_GROUP = 5000;
+    private static final int NUM_USERS_PER_GROUP_MIN = 100;
+    private static final int NUM_USERS_PER_GROUP_MAX = 500;
     private static final int NUM_GROUPS = 300;
-    private static final int NUM_READERS = 8;
-    private static final int NUM_WRITERS = 8;
+    private static final int NUM_READERS = 10;
+    private static final int NUM_WRITERS = 4;
 
     private static final int TIME_TEST = 25000;
     private static final int TIME_RAMP_UP = 1000;
@@ -62,6 +63,7 @@ public class MembershipCachePerfTest extends JUnitTest {
     private JackrabbitSession session;
     private UserManager userMgr;
     private MembershipCache cache;
+    private long avgNumUsers;
 
     @Override
     protected void setUp() throws Exception {
@@ -91,9 +93,12 @@ public class MembershipCachePerfTest extends JUnitTest {
         System.out.println();
 
         System.out.printf("Creating %d groups...", NUM_GROUPS).flush();
+        avgNumUsers = 0;
         for (int i = 0; i < NUM_GROUPS; i++) {
             Group g = userMgr.createGroup(TEST_GROUP_PREFIX + i);
-            for (int j=0; j<NUM_USERS_PER_GROUP; j++) {
+            int numUsers = (int) (Math.random()*(NUM_USERS_PER_GROUP_MAX-NUM_USERS_PER_GROUP_MIN) + NUM_USERS_PER_GROUP_MIN);
+            avgNumUsers += numUsers;
+            for (int j=0; j<numUsers; j++) {
                 g.addMember(users.get(j));
             }
             if (i%4 == 0) {
@@ -104,6 +109,7 @@ public class MembershipCachePerfTest extends JUnitTest {
                 }
             }
         }
+        avgNumUsers /= NUM_GROUPS;
         session.save();
         System.out.println();
         userMgr.autoSave(autoSave);
@@ -192,7 +198,7 @@ public class MembershipCachePerfTest extends JUnitTest {
         System.out.printf("-----------------------------------------------\n");
         System.out.printf("Test time: %d, Ramp-up time %d\n", TIME_TEST, TIME_RAMP_UP);
         System.out.printf("Number of users: %d\n", NUM_USERS);
-        System.out.printf("Avg number of users/group: %d\n", NUM_USERS_PER_GROUP);
+        System.out.printf("Avg number of users/group: %d\n", avgNumUsers);
         System.out.printf("Number of groups: %d\n", NUM_GROUPS);
         System.out.printf("Number of readers: %d\n", NUM_READERS);
         System.out.printf("Number of writers: %d\n", NUM_WRITERS);
@@ -315,7 +321,7 @@ public class MembershipCachePerfTest extends JUnitTest {
                             session.refresh(false);
                         }
                     } while (running);
-                    Thread.sleep(10);
+                    Thread.sleep(100);
                 }
             } catch (RepositoryException e) {
                 exceptions.add(e);
