@@ -376,15 +376,16 @@ abstract class AuthorizableImpl implements Authorizable, UserConstants {
         }
         final long t2 = System.nanoTime();
         if (log.isDebugEnabled()) {
-            log.debug("Collected {} {} group ids for [{}] in {}us, loaded {} groups in {}us (collect={}, cachesize={})", new Object[]{
+            log.debug("Collected {} {} group ids for [{}] in {}us, loaded {} groups in {}us (collect={}, cachesize={}/{})", new Object[]{
                     groupNodeIds.size(),
-                    includeIndirect ? "all" : "declared",
+                    includeIndirect ? "transitive" : "declared",
                     getID(),
                     (t1-t0) / 1000,
                     groups.size(),
                     (t2-t1) / 1000,
                     collect,
-                    cache.getSize()
+                    cache.getMembershipCacheSize(),
+                    cache.getMemberCacheSize(),
             });
         }
         return new RangeIteratorAdapter(groups.iterator(), groups.size());

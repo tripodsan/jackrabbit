@@ -18,9 +18,14 @@ package org.apache.jackrabbit.core.security.user;
 
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.jcr.AccessDeniedException;
 import javax.jcr.ItemNotFoundException;
@@ -35,21 +40,34 @@ import javax.jcr.Value;
 import javax.jcr.observation.Event;
 import javax.jcr.observation.EventIterator;
 
+import org.apache.jackrabbit.commons.flat.BTreeManager;
+import org.apache.jackrabbit.commons.flat.ItemSequence;
+import org.apache.jackrabbit.commons.flat.PropertySequence;
+import org.apache.jackrabbit.commons.flat.Rank;
+import org.apache.jackrabbit.commons.flat.TreeManager;
 import org.apache.jackrabbit.core.NodeImpl;
 import org.apache.jackrabbit.core.PropertyImpl;
 import org.apache.jackrabbit.core.SessionImpl;
 import org.apache.jackrabbit.core.SessionListener;
 import org.apache.jackrabbit.core.cache.ConcurrentCache;
-import org.apache.jackrabbit.core.nodetype.NodeTypeImpl;
 import org.apache.jackrabbit.core.observation.SynchronousEventListener;
-import org.apache.jackrabbit.spi.Name;
-import org.apache.jackrabbit.spi.commons.name.NameConstants;
-import org.apache.jackrabbit.util.Text;
+import org.apache.jackrabbit.spi.commons.iterator.Iterators;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * <code>MembershipCache</code>...
+ * The <code>MembershipCache</code> is used to load and cache the memberships of authorizables. The reverse lookup of
+ * the groups an authorizable belongs to, can be slow on large systems, since the WEAK_REFERENCE resolution uses a query.
+ *
+ * The cache remembers the declared (direct) group ids of the authorizables in the {@code membership} cache.
+ * It also remembers the members that were involved during a lookup in the {@code members} cache.
+ *
+ * When a group is modified, it checks if a member that was used during the lookup is no longer exits (remove member).
+ * In this case the cache for that authorizable (and all decedents) is invalidated. If a member exists that we already
+ * have a cached entry for, but was not used during lookup, we invalidate as well (add member).
+ *
+ * Please note, that if any of the caches are full, we cannot calculate the individual invalidation anymore, and the
+ * entire cache is flushed.
  */
 public class MembershipCache implements UserConstants, SynchronousEventListener, SessionListener {
 
@@ -59,16 +77,39 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
     private static final Logger log = LoggerFactory.getLogger(MembershipCache.class);
 
     /**
+     * The maximum size of the membership cache
+     */
+    private static final int MAX_MEMBERSHIP_CACHE_SIZE =
+            Integer.getInteger("org.apache.jackrabbit.MembershipCache", 5000);
+
+    /**
      * The maximum size of this cache
      */
-    private static final int MAX_CACHE_SIZE =
-            Integer.getInteger("org.apache.jackrabbit.MembershipCache", 5000);
+    private static final int MAX_MEMBER_CACHE_SIZE =
+            Integer.getInteger("org.apache.jackrabbit.MemberCache", 5000);
 
     private final SessionImpl systemSession;
     private final String groupsPath;
     private final boolean useMembersNode;
+
     private final String pMembers;
-    private final ConcurrentCache<String, Collection<String>> cache;
+
+    private final String repMembersSuffix;
+
+    /**
+     * Cache that contains the declared memberships of the authorizables
+     * (key = authorizableNodeIdentifier, value = collection of groupNodeIdentifier)
+     */
+    private final ConcurrentCache<String, Collection<String>> membership;
+
+    /**
+     * Cache that contains the group members that were used during lookup.
+     * (key = groupNodeIdentifier, value = collection of member nodeIdentifier)
+     *
+     * Note: we only define a map here, so we can use a {@link ConcurrentHashMap}
+     */
+    private final ConcurrentCache<String, Map<String,String>> members;
+
 
     MembershipCache(SessionImpl systemSession, String groupsPath, boolean useMembersNode) throws RepositoryException {
         this.systemSession = systemSession;
@@ -76,8 +117,12 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
         this.useMembersNode = useMembersNode;
 
         pMembers = systemSession.getJCRName(UserManagerImpl.P_MEMBERS);
-        cache = new ConcurrentCache<String, Collection<String>>("MembershipCache", 16);
-        cache.setMaxMemorySize(MAX_CACHE_SIZE);
+        repMembersSuffix = "/" + pMembers;
+        membership = new ConcurrentCache<String, Collection<String>>("MembershipCache", 16);
+        membership.setMaxMemorySize(MAX_MEMBERSHIP_CACHE_SIZE);
+
+        members = new ConcurrentCache<String, Map<String,String>>("MemberCache", 16);
+        members.setMaxMemorySize(MAX_MEMBER_CACHE_SIZE);
 
         String[] ntNames = new String[] {
                 systemSession.getJCRName(UserConstants.NT_REP_GROUP),
@@ -85,7 +130,7 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
         };
         // register event listener to be informed about membership changes.
         systemSession.getWorkspace().getObservationManager().addEventListener(this,
-                Event.PROPERTY_ADDED | Event.PROPERTY_CHANGED | Event.PROPERTY_REMOVED,
+                Event.PROPERTY_ADDED | Event.PROPERTY_CHANGED | Event.PROPERTY_REMOVED | Event.NODE_ADDED | Event.NODE_REMOVED,
                 groupsPath,
                 true,
                 null,
@@ -94,7 +139,7 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
         // make sure the membership cache is informed if the system session is
         // logged out in order to stop listening to events.
         systemSession.addListener(this);
-        log.debug("Membership cache initialized. Max Size = {}", MAX_CACHE_SIZE);
+        log.debug("Membership cache initialized. Max membership size = {}, Max member size = {}", MAX_MEMBERSHIP_CACHE_SIZE, MAX_MEMBER_CACHE_SIZE);
     }
 
 
@@ -104,45 +149,109 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
      */
     public void onEvent(EventIterator eventIterator) {
         // evaluate if the membership cache needs to be cleared;
+        final long t0 = System.nanoTime();
         boolean clear = false;
+        Set<String> groupPaths = new HashSet<String>();
         while (eventIterator.hasNext() && !clear) {
             Event ev = eventIterator.nextEvent();
             try {
-                if (pMembers.equals(Text.getName(ev.getPath()))) {
-                    // simple case: a rep:members property that is affected
-                    clear = true;
-                } else if (useMembersNode) {
-                    // test if it affects a property defined by rep:Members node type.
-                    int type = ev.getType();
-                    if (type == Event.PROPERTY_ADDED || type == Event.PROPERTY_CHANGED) {
-                        Property p = systemSession.getProperty(ev.getPath());
-                        Name declNtName = ((NodeTypeImpl) p.getDefinition().getDeclaringNodeType()).getQName();
-                        clear = NT_REP_MEMBERS.equals(declNtName);
-                    } else {
-                        // PROPERTY_REMOVED
-                        // test if the primary node type of the parent node is rep:Members
-                        // this could potentially by some other property as well as the
-                        // rep:Members node are not protected and could changed by
-                        // adding a mixin type.
-                        // ignoring this and simply clear the cache
-                        String parentId = ev.getIdentifier();
-                        Node n = systemSession.getNodeByIdentifier(parentId);
-                        Name ntName = ((NodeTypeImpl) n.getPrimaryNodeType()).getQName();
-                        clear = (UserConstants.NT_REP_MEMBERS.equals(ntName));
+                String path = ev.getPath();
+                // event must happen at or below a rep:members item
+                int idx = path.indexOf(repMembersSuffix);
+                if (idx > 0) {
+                    String groupPath = path.substring(0, idx);
+                    boolean newGroup = groupPaths.add(groupPath);
+                    if (newGroup && log.isDebugEnabled()) {
+                        log.debug("event received for modified group: {}", groupPath);
                     }
                 }
             } catch (RepositoryException e) {
-                log.warn(e.getMessage());
-                // exception while processing the event -> clear the cache to
-                // be sure it isn't outdated.
+                log.warn("error during processing observation event, clearing cache", e);
+                // exception while processing the event -> clear the cache to be sure it isn't outdated.
+                clear = true;
+            }
+        }
+
+        int numInvalidated = 0;
+        if (!clear) {
+            try {
+                // now go through all modified groups and get the current group memberships
+                for (String groupPath: groupPaths) {
+                    if (!systemSession.nodeExists(groupPath)) {
+                        // group no longer exists, and we can't determine the node identifier -> clear
+                        log.info("observation event for deleted group {}, clearing cache.", groupPath);
+                        clear = true;
+                        break;
+                    }
+                    Node groupNode = systemSession.getNode(groupPath);
+                    String gNid = groupNode.getIdentifier();
+                    Map<String,String> oldMembers = members.get(gNid);
+                    Map<String,String> newMembers = null;
+
+                    // create a copy
+                    oldMembers = oldMembers == null ? null : new HashMap<String, String>(oldMembers);
+
+                    Iterator<String> refs = getMembershipProvider((NodeImpl) groupNode).getDeclaredMemberReferences();
+                    while (refs.hasNext()) {
+                        String aNid = refs.next();
+                        if (oldMembers != null && oldMembers.remove(aNid) != null) {
+                            // authorizable was used during lookup.
+                            if (membership.containsKey(aNid)) {
+                                log.trace("member {} of {} not altered.", aNid, gNid);
+                                if (newMembers == null) {
+                                    newMembers = new ConcurrentHashMap<String, String>();
+                                }
+                                newMembers.put(aNid, aNid);
+                            } else {
+                                log.trace("member {} of {} not but authorizable no longer cached.", aNid, gNid);
+                            }
+                        } else {
+                            // authorizable was not used yet, check if we cached it
+                            if (membership.containsKey(aNid)) {
+                                // so this is an addition
+                                log.trace("authorizable {} added as member of {}", aNid, gNid);
+                                numInvalidated += invalidate(aNid);
+                            } else {
+                                // all good. never used.
+                                log.trace("member {} of {} not in cache at all", aNid, gNid);
+                            }
+                        }
+                    }
+
+                    if (oldMembers != null && !oldMembers.isEmpty()) {
+                        for (String aNid: oldMembers.keySet()) {
+                            // authorizable no longer member of
+                            if (membership.containsKey(aNid)) {
+                                log.trace("authorizable {} removed as member from {}.", aNid, gNid);
+                                numInvalidated += invalidate(aNid);
+                            } else {
+                                log.trace("authorizable {} no longer member of {} but also no longer cached.", aNid, gNid);
+                            }
+                        }
+                    }
+
+                    if (newMembers == null) {
+                        members.remove(gNid);
+                    } else {
+                        members.put(gNid, newMembers, 1);
+                    }
+                }
+            } catch (RepositoryException e) {
+                log.info("internal error during event evaluation. clearing cache.", e);
                 clear = true;
             }
         }
 
         if (clear) {
-            cache.clear();
-            log.debug("Membership cache cleared because of observation event.");
+            numInvalidated += getMembershipCacheSize();
+            clear();
+            log.debug("Membership cache cleared because of problems in observation event.");
         }
+
+        if (log.isDebugEnabled()) {
+            log.debug("event processing took {}us. invalidated {} memberships", (System.nanoTime() - t0) / 1000, numInvalidated);
+        }
+
     }
 
     //----------------------------------------------------< SessionListener >---
@@ -194,15 +303,61 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
      * Returns the size of the membership cache
      * @return the size
      */
-    int getSize() {
-        return (int) cache.getElementCount();
+    public int getMembershipCacheSize() {
+        return (int) membership.getElementCount();
     }
 
     /**
-     * For testing purposes only.
+     * Returns the size of the member cache
+     * @return the size
      */
-    void clear() {
-        cache.clear();
+    public int getMemberCacheSize() {
+        return (int) members.getElementCount();
+    }
+
+    /**
+     * clears the cache
+     */
+    public void clear() {
+        members.clear();
+        membership.clear();
+    }
+
+    /**
+     * invalidate a single entry
+     * @param authorizableNodeId the node identifier to invalidate
+     * @return the number of invalidated memberships
+     */
+    public int invalidate(String authorizableNodeId) {
+        int num = membership.remove(authorizableNodeId) == null ? 0 : 1;
+        if (log.isTraceEnabled()) {
+            log.trace("invalidating {} (was cached={})", authorizableNodeId, num > 0);
+        }
+        Map<String, String> m = members.remove(authorizableNodeId);
+        if (m != null) {
+            for (String mnid: m.keySet()) {
+                num += invalidate(mnid);
+            }
+        }
+        return num;
+    }
+
+    /**
+     * Sets the membership cache size
+     * @param size the new size
+     */
+    public void setMembershipCacheMaxSize(int size) {
+        clear();
+        membership.setMaxMemorySize(size);
+    }
+
+    /**
+     * Sets the member cache size
+     * @param size the new size
+     */
+    public void setMemberCacheMaxSize(int size) {
+        clear();
+        members.setMaxMemorySize(size);
     }
 
     /**
@@ -274,7 +429,7 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
     private Collection<String> declaredMemberOf(String authorizableNodeIdentifier) throws RepositoryException {
         final long t0 = System.nanoTime();
 
-        Collection<String> groupNodeIds = cache.get(authorizableNodeIdentifier);
+        Collection<String> groupNodeIds = membership.get(authorizableNodeIdentifier);
 
         boolean wasCached = true;
         if (groupNodeIds == null) {
@@ -284,7 +439,15 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
             Session session = getSession();
             try {
                 groupNodeIds = collectDeclaredMembership(authorizableNodeIdentifier, session);
-                cache.put(authorizableNodeIdentifier, Collections.unmodifiableCollection(groupNodeIds), 1);
+                membership.put(authorizableNodeIdentifier, Collections.unmodifiableCollection(groupNodeIds), 1);
+                for (String groupId: groupNodeIds) {
+                    Map<String, String> m = members.get(groupId);
+                    if (m == null) {
+                        m = new ConcurrentHashMap<String, String>();
+                        members.put(groupId, m, 1);
+                    }
+                    m.put(authorizableNodeIdentifier, authorizableNodeIdentifier);
+                }
             }
             finally {
                 // release session if it isn't the original system session
@@ -296,12 +459,13 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
 
         if (log.isDebugEnabled()) {
             final long t1 = System.nanoTime();
-            log.debug("Membership cache {} {} declared memberships of {} in {}us. cache size = {}", new Object[]{
+            log.debug("Membership cache {} {} declared memberships of {} in {}us. cache size = {}/{}", new Object[]{
                     wasCached ? "returns" : "collected",
                     groupNodeIds.size(),
                     authorizableNodeIdentifier,
                     (t1-t0) / 1000,
-                    cache.getElementCount()
+                    getMembershipCacheSize(),
+                    getMemberCacheSize()
             });
         }
         return groupNodeIds;
@@ -560,4 +724,134 @@ public class MembershipCache implements UserConstants, SynchronousEventListener,
         }
         return refs;
     }
+
+
+    // --------------------------------------------------------------------------
+    // todo: merge with GroupImpl code
+
+    private MembershipProvider getMembershipProvider(NodeImpl node) throws RepositoryException {
+        MembershipProvider msp;
+        if (useMembersNode) {
+            if (node.hasNode(N_MEMBERS) || !node.hasProperty(P_MEMBERS)) {
+                msp = new NodeBasedMembershipProvider(node);
+            } else {
+                msp = new PropertyBasedMembershipProvider(node);
+            }
+        } else {
+            msp = new PropertyBasedMembershipProvider(node);
+        }
+
+        if (node.hasProperty(P_MEMBERS) && node.hasNode(N_MEMBERS)) {
+            log.warn("Found members node and members property on node {}. Ignoring {} members", node, useMembersNode ? "property" : "node");
+        }
+        return msp;
+    }
+
+    /**
+     * Inner MembershipProvider interface
+     */
+    private interface MembershipProvider {
+
+        Iterator<String> getDeclaredMemberReferences() throws RepositoryException;
+    }
+
+    /**
+     * PropertyBasedMembershipProvider
+     */
+    private class PropertyBasedMembershipProvider implements MembershipProvider {
+        private final NodeImpl node;
+
+        private PropertyBasedMembershipProvider(NodeImpl node) {
+            super();
+            this.node = node;
+        }
+
+        public Iterator<String> getDeclaredMemberReferences() throws RepositoryException {
+            if (node.hasProperty(P_MEMBERS)) {
+                final Value[] members = node.getProperty(P_MEMBERS).getValues();
+
+                return new Iterator<String>() {
+
+                    private int pos;
+
+                    @Override
+                    public boolean hasNext() {
+                        return pos < members.length;
+                    }
+
+                    @Override
+                    public String next() {
+                        if (pos < members.length) {
+                            try {
+                                return members[pos++].getString();
+                            } catch (RepositoryException e) {
+                                throw new IllegalStateException(e);
+                            }
+                        } else {
+                            throw new NoSuchElementException();
+                        }
+                    }
+
+                    @Override
+                    public void remove() {
+                        throw new UnsupportedOperationException();
+                    }
+                };
+
+            } else {
+                return Iterators.empty();
+            }
+        }
+    }
+
+    /**
+     * NodeBasedMembershipProvider
+     */
+    private class NodeBasedMembershipProvider implements MembershipProvider {
+        private final NodeImpl node;
+
+        private NodeBasedMembershipProvider(NodeImpl node) {
+            this.node = node;
+        }
+
+        public Iterator<String> getDeclaredMemberReferences() throws RepositoryException {
+            if (node.hasNode(N_MEMBERS)) {
+                final Iterator<Property> members = getPropertySequence(node.getNode(N_MEMBERS)).iterator();
+
+                return new Iterator<String>() {
+                    @Override
+                    public boolean hasNext() {
+                        return members.hasNext();
+                    }
+
+                    @Override
+                    public String next() {
+                        try {
+                            return members.next().getString();
+                        } catch (RepositoryException e) {
+                            throw new IllegalStateException(e);
+                        }
+                    }
+
+                    @Override
+                    public void remove() {
+                        throw new UnsupportedOperationException();
+                    }
+                };
+            } else {
+                return Iterators.empty();
+            }
+        }
+
+    }
+
+    static PropertySequence getPropertySequence(Node nMembers) throws RepositoryException {
+        Comparator<String> order = Rank.comparableComparator();
+        int maxChildren = 4;
+        int minChildren = maxChildren / 2;
+        TreeManager treeManager = new BTreeManager(nMembers, minChildren, maxChildren, order, false);
+        return ItemSequence.createPropertySequence(treeManager);
+    }
+
+
 }
