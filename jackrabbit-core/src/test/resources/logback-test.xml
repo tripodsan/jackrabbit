@@ -40,6 +40,8 @@
   </appender>
 
   <logger name="org.apache.jackrabbit.test" level="DEBUG"/>
+  <logger name="org.apache.jackrabbit.core.security.user.MembershipCache" level="DEBUG"/>
+  <logger name="org.apache.jackrabbit.core.security.user.AuthorizableImpl" level="DEBUG"/>
 
   <root level="INFO">
     <appender-ref ref="file"/>

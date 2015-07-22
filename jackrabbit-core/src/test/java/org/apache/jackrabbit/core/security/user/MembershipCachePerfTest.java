@@ -54,7 +54,7 @@ public class MembershipCachePerfTest extends JUnitTest {
     private static final int NUM_READERS = 8;
     private static final int NUM_WRITERS = 8;
 
-    private static final int TIME_TEST = 20000;
+    private static final int TIME_TEST = 25000;
     private static final int TIME_RAMP_UP = 1000;
 
 
@@ -67,8 +67,7 @@ public class MembershipCachePerfTest extends JUnitTest {
     protected void setUp() throws Exception {
         super.setUp();
         FileUtils.deleteDirectory(new File(REPO_HOME));
-        RepositoryConfig config = RepositoryConfig.create(
-                getClass().getResourceAsStream("repository-membersplit.xml"), REPO_HOME);
+        RepositoryConfig config = RepositoryConfig.create(getClass().getResourceAsStream("repository-membersplit.xml"), REPO_HOME);
         repo = RepositoryImpl.create(config);
         session = createSession();
         userMgr = session.getUserManager();
@@ -76,33 +75,56 @@ public class MembershipCachePerfTest extends JUnitTest {
         boolean autoSave = userMgr.isAutoSave();
         userMgr.autoSave(false);
         // create test users and groups
-        System.out.printf("Creating %d users...\n", NUM_USERS);
+        System.out.printf("Creating %d users...", NUM_USERS).flush();
         List<User> users = new ArrayList<User>();
         for (int i = 0; i < NUM_USERS; i++) {
             users.add(userMgr.createUser(TEST_USER_PREFIX + i, "secret"));
+            if (i%50 == 0) {
+                session.save();
+                System.out.printf(".").flush();
+                if (i%200 == 0) {
+                    System.out.printf("%d", i).flush();
+                }
+            }
         }
-        System.out.printf("Creating %d groups...\n", NUM_GROUPS);
+        session.save();
+        System.out.println();
+
+        System.out.printf("Creating %d groups...", NUM_GROUPS).flush();
         for (int i = 0; i < NUM_GROUPS; i++) {
             Group g = userMgr.createGroup(TEST_GROUP_PREFIX + i);
             for (int j=0; j<NUM_USERS_PER_GROUP; j++) {
                 g.addMember(users.get(j));
             }
-            session.save();
-            System.out.printf(".").flush();
+            if (i%4 == 0) {
+                session.save();
+                System.out.printf(".").flush();
+                if (i%20 == 0) {
+                    System.out.printf("%d", i).flush();
+                }
+            }
         }
+        session.save();
+        System.out.println();
         userMgr.autoSave(autoSave);
-        logger.info("Initial cache size: " + cache.getSize());
+        logger.info("Initial cache size: {}/{}", cache.getMembershipCacheSize(), cache.getMemberCacheSize());
     }
 
     @Override
     protected void tearDown() throws Exception {
         boolean autoSave = userMgr.isAutoSave();
         userMgr.autoSave(false);
-        for (int i = 0; i < NUM_USERS; i++) {
-            userMgr.getAuthorizable(TEST_USER_PREFIX + i).remove();
-        }
         for (int i = 0; i < NUM_GROUPS; i++) {
             userMgr.getAuthorizable(TEST_GROUP_PREFIX + i).remove();
+            if (i%100 == 0) {
+                session.save();
+            }
+        }
+        for (int i = 0; i < NUM_USERS; i++) {
+            userMgr.getAuthorizable(TEST_USER_PREFIX + i).remove();
+            if (i%100 == 0) {
+                session.save();
+            }
         }
         session.save();
         userMgr.autoSave(autoSave);
@@ -131,9 +153,6 @@ public class MembershipCachePerfTest extends JUnitTest {
             writers.add(w);
         }
 
-        Node test = session.getRootNode().addNode("test", "nt:unstructured");
-        session.save();
-
         for (Reader r : readers) {
             r.start();
         }
@@ -150,8 +169,8 @@ public class MembershipCachePerfTest extends JUnitTest {
 
         long endTime = System.currentTimeMillis() + TIME_TEST;
         while (System.currentTimeMillis() < endTime) {
-            Thread.sleep(1000);
-            System.out.printf("running...current cache size: %d\n", cache.getSize());
+            Thread.sleep(500);
+            System.out.printf("running...current cache size: %d/%d\n", cache.getMembershipCacheSize(), cache.getMemberCacheSize());
         }
 
         for (Reader r : readers) {
@@ -161,15 +180,14 @@ public class MembershipCachePerfTest extends JUnitTest {
             w.setRunning(false);
         }
 
+        System.out.println("stopping readers...");
         for (Reader r : readers) {
             r.join();
         }
+        System.out.println("stopping writers...");
         for (Writer w : writers) {
             w.join();
         }
-
-        test.remove();
-        session.save();
 
         System.out.printf("-----------------------------------------------\n");
         System.out.printf("Test time: %d, Ramp-up time %d\n", TIME_TEST, TIME_RAMP_UP);
@@ -178,7 +196,7 @@ public class MembershipCachePerfTest extends JUnitTest {
         System.out.printf("Number of groups: %d\n", NUM_GROUPS);
         System.out.printf("Number of readers: %d\n", NUM_READERS);
         System.out.printf("Number of writers: %d\n", NUM_WRITERS);
-        System.out.printf("Cache size: %d\n", cache.getSize());
+        System.out.printf("Cache size: %d/%d\n", cache.getMembershipCacheSize(), cache.getMemberCacheSize());
         System.out.printf("Time to get memberships:\n");
         readerStats.printResults(System.out);
         System.out.printf("-----------------------------------------------\n");
@@ -189,7 +207,6 @@ public class MembershipCachePerfTest extends JUnitTest {
         for (Exception e : exceptions) {
             throw e;
         }
-        logger.info("cache size: " + cache.getSize());
     }
 
     private JackrabbitSession createSession() throws RepositoryException {
@@ -226,11 +243,22 @@ public class MembershipCachePerfTest extends JUnitTest {
                 while (running) {
                     int idx = random.nextInt(NUM_USERS);
                     Authorizable user = userMgr.getAuthorizable(TEST_USER_PREFIX + idx);
-                    long time = System.nanoTime();
-                    user.memberOf();
-                    stats.logTime(System.nanoTime() - time);
+                    do {
+                        try {
+                            long time = System.nanoTime();
+                            user.memberOf();
+                            stats.logTime(System.nanoTime() - time);
+                            break;
+                        } catch (InvalidItemStateException e) {
+                            // concurrent reading...try again
+                            session.refresh(false);
+                        }
+                    } while (running);
+                    Thread.sleep(10);
                 }
             } catch (RepositoryException e) {
+                exceptions.add(e);
+            } catch (InterruptedException e) {
                 exceptions.add(e);
             } finally {
                 session.logout();
@@ -272,8 +300,8 @@ public class MembershipCachePerfTest extends JUnitTest {
                     Group group = (Group) userMgr.getAuthorizable(TEST_GROUP_PREFIX + groupIdx);
 
                     do {
-                        long time = System.nanoTime();
                         try {
+                            long time = System.nanoTime();
                             if (group.isDeclaredMember(user)) {
                                 group.removeMember(user);
                             } else {

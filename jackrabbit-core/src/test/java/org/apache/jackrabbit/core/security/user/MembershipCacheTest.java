@@ -77,7 +77,7 @@ public class MembershipCacheTest extends JUnitTest {
         }
         session.save();
         userMgr.autoSave(autoSave);
-        logger.info("Initial cache size: " + cache.getSize());
+        logger.info("Initial cache size: {}/{}", cache.getMembershipCacheSize(), cache.getMemberCacheSize());
     }
 
     @Override
